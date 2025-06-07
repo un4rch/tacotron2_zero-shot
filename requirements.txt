@@ -1,0 +1,15 @@
+torch
+pytorch-lightning
+torchaudio
+torchvision
+soundfile
+scipy
+speechbrain
+librosa
+matplotlib
+peft
+pandas
+unidecode
+inflect
+tensorflow
+mlflow
