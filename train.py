@@ -136,6 +136,156 @@ class Tacotron2Loss(nn.Module):
         gate_loss = self.bce(gate_out, gate_target)
         return mel_loss + gate_loss
 
+class GuidedAttentionLoss(nn.Module):
+    """Guided attention loss function module."""
+
+    def __init__(self, sigma=0.4, alpha=1.0, reset_always=True):
+        super(GuidedAttentionLoss, self).__init__()
+        self.sigma = sigma
+        self.alpha = alpha
+        self.reset_always = reset_always
+        self.guided_attn_masks = None
+        self.masks = None
+
+    def _reset_masks(self):
+        self.guided_attn_masks = None
+        self.masks = None
+
+    def forward(self, att_ws, ilens, olens):
+        """
+        att_ws: (B, T_max_out, T_max_in)
+        ilens: (B,) LongTensor
+        olens: (B,) LongTensor
+        """
+        device = att_ws.device  # use same device as attention weights
+        ilens_list = ilens.tolist() if isinstance(ilens, torch.Tensor) else ilens
+        olens_list = olens.tolist() if isinstance(olens, torch.Tensor) else olens
+
+        if self.guided_attn_masks is None:
+            self.guided_attn_masks = self._make_guided_attention_masks(ilens_list, olens_list, device=device)
+        if self.masks is None:
+            self.masks = self._make_masks(ilens_list, olens_list, device=device)
+        losses = self.guided_attn_masks * att_ws
+        loss = torch.mean(losses.masked_select(self.masks))
+        if self.reset_always:
+            self._reset_masks()
+        return self.alpha * loss
+
+    def _make_guided_attention_masks(self, ilens, olens, device='cpu'):
+        n_batches = len(ilens)
+        max_ilen = max(ilens)
+        max_olen = max(olens)
+        guided_attn_masks = torch.zeros((n_batches, max_olen, max_ilen), device=device)
+        for idx, (ilen, olen) in enumerate(zip(ilens, olens)):
+            guided_attn_masks[idx, :olen, :ilen] = self._make_guided_attention_mask(
+                ilen, olen, self.sigma, device=device
+            )
+        return guided_attn_masks
+
+    @staticmethod
+    def _make_guided_attention_mask(ilen, olen, sigma, device='cpu'):
+        # PyTorch >= 1.10 recommends specifying 'indexing'
+        try:
+            grid_x, grid_y = torch.meshgrid(
+                torch.arange(olen, device=device),
+                torch.arange(ilen, device=device),
+                indexing="ij"
+            )
+        except TypeError:
+            grid_x, grid_y = torch.meshgrid(
+                torch.arange(olen, device=device),
+                torch.arange(ilen, device=device)
+            )
+        grid_x, grid_y = grid_x.float(), grid_y.float()
+        return 1.0 - torch.exp(
+            -((grid_y / ilen - grid_x / olen) ** 2) / (2 * (sigma ** 2))
+        )
+
+    def _make_masks(self, ilens, olens, device='cpu'):
+        in_masks = self.make_non_pad_mask(ilens, device=device)  # (B, T_in)
+        out_masks = self.make_non_pad_mask(olens, device=device)  # (B, T_out)
+        return out_masks.unsqueeze(-1) & in_masks.unsqueeze(-2)  # (B, T_out, T_in)
+
+    def make_non_pad_mask(self, lengths, device='cpu', xs=None, length_dim=-1):
+        return ~self.make_pad_mask(lengths, device=device, xs=xs, length_dim=length_dim)
+
+    def make_pad_mask(self, lengths, device='cpu', xs=None, length_dim=-1):
+        if length_dim == 0:
+            raise ValueError("length_dim cannot be 0: {}".format(length_dim))
+
+        if not isinstance(lengths, list):
+            lengths = lengths.tolist()
+        bs = int(len(lengths))
+        if xs is None:
+            maxlen = int(max(lengths))
+        else:
+            maxlen = xs.size(length_dim)
+
+        seq_range = torch.arange(0, maxlen, dtype=torch.int64, device=device)
+        seq_range_expand = seq_range.unsqueeze(0).expand(bs, maxlen)
+        seq_length_expand = seq_range_expand.new(lengths).unsqueeze(-1)
+        mask = seq_range_expand >= seq_length_expand
+
+        if xs is not None:
+            assert xs.size(0) == bs, (xs.size(0), bs)
+
+            if length_dim < 0:
+                length_dim = xs.dim() + length_dim
+            ind = tuple(
+                slice(None) if i in (0, length_dim) else None for i in range(xs.dim())
+            )
+            mask = mask[ind].expand_as(xs).to(xs.device)
+        return mask
+
+class Tacotron2CombinedLoss(nn.Module):
+    def __init__(self, guided_attn_loss_weight=0.2, sigma=0.4, alpha=1.0):
+        super().__init__()
+        self.mse = nn.MSELoss()
+        self.bce = nn.BCEWithLogitsLoss()
+        self.guided_attn = GuidedAttentionLoss(sigma=sigma, alpha=alpha)
+        self.guided_attn_loss_weight = guided_attn_loss_weight
+
+    def forward(self, model_output, targets, input_lengths, output_lengths):
+        mel_target, gate_target = targets
+        mel_target.requires_grad = False
+        gate_target.requires_grad = False
+        gate_target = gate_target.view(-1, 1)
+        mel_out, mel_out_postnet, gate_out, alignments = model_output
+        gate_out = gate_out.view(-1, 1)
+        mel_loss = self.mse(mel_out, mel_target) + self.mse(mel_out_postnet, mel_target)
+        gate_loss = self.bce(gate_out, gate_target)
+        # Guided attention loss
+        guided_loss = self.guided_attn(
+            alignments, input_lengths, output_lengths
+        )
+        total_loss = mel_loss + gate_loss + self.guided_attn_loss_weight * guided_loss
+        return total_loss
+
+class EarlyStopping:
+    def __init__(self, patience=10, min_delta=0.0, verbose=True, save_path=None):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.verbose = verbose
+        self.best_loss = None
+        self.counter = 0
+        self.early_stop = False
+        self.save_path = save_path
+
+    def __call__(self, val_loss, model=None):
+        if self.best_loss is None or val_loss < self.best_loss - self.min_delta:
+            if self.verbose:
+                print(f"Validation loss improved: {self.best_loss} -> {val_loss}")
+            self.best_loss = val_loss
+            self.counter = 0
+            if self.save_path and model is not None:
+                torch.save(model.state_dict(), self.save_path)
+        else:
+            self.counter += 1
+            if self.verbose:
+                print(f"EarlyStopping counter: {self.counter} of {self.patience}")
+            if self.counter >= self.patience:
+                self.early_stop = True
+
 # === Prepare Dataset and Dataloader ===
 dataset = TTSDataset(METADATA)
 n = len(dataset)
@@ -171,8 +321,15 @@ model = Tacotron2(
     decoder_no_early_stopping=hparams["decoder_no_early_stopping"],
     speaker_embedding_dim=hparams["speaker_embedding_dim"]
 ).to(device)
-optimizer = optim.Adam(model.parameters(), lr=hparams["learning_rate"])
-criterion = Tacotron2Loss()
+optimizer = optim.Adam(model.parameters(), lr=hparams["learning_rate"], weight_decay=1e-5)
+criterion = Tacotron2CombinedLoss(guided_attn_loss_weight=0.2, sigma=0.4, alpha=1.0)
+# Early stopping
+early_stopper = EarlyStopping(
+    patience=hparams.get("early_stopping_patience", 20),
+    min_delta=1e-3,
+    verbose=True,
+    save_path=os.path.join(CHECKPOINTS_DIR, "best_model.pth")
+)
 
 train_loss_history = []
 val_loss_history = []
@@ -199,7 +356,11 @@ for epoch in range(hparams["epochs"]):
         inputs = (text_padded.to(device), input_lengths.to(device), mel_targets, max_len, output_lengths)
         model.zero_grad()
         outputs = model(inputs, speaker_embedding=spk_embeddings)
-        loss = criterion(outputs, (mel_targets, gate_targets))
+        loss = criterion(
+            outputs, (mel_targets, gate_targets), 
+            input_lengths=input_lengths, 
+            output_lengths=output_lengths
+        )
         loss.backward()
         optimizer.step()
 
@@ -240,7 +401,11 @@ for epoch in range(hparams["epochs"]):
 
             inputs = (text_padded.to(device), input_lengths.to(device), mel_targets, max_len, output_lengths)
             outputs = model(inputs, speaker_embedding=spk_embeddings)
-            val_loss = criterion(outputs, (mel_targets, gate_targets))
+            val_loss = criterion(
+                outputs, (mel_targets, gate_targets), 
+                input_lengths=input_lengths, 
+                output_lengths=output_lengths
+            )
             epoch_val_losses.append(val_loss.item())
 
             # === DEBUG gate values for validation ===
@@ -292,6 +457,12 @@ for epoch in range(hparams["epochs"]):
                 val_sample['mel_pred'],
                 os.path.join(VIS_DIR, f"mel_compare_epoch{epoch}.png")
             )
+    
+    # === EARLY STOPPING ===
+    early_stopper(avg_val_loss, model)
+    if early_stopper.early_stop:
+        print("Early stopping triggered.")
+        break
 
     print(f"Epoch {epoch} | Train Loss: {avg_train_loss:.3f} | Val Loss: {avg_val_loss:.3f}")
 
