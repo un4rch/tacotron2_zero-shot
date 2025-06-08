@@ -45,7 +45,7 @@ os.makedirs(VIS_DIR, exist_ok=True)
 with open(HPARAMS_PATH, "r") as f:
     hparams = json.load(f)
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 # === MLflow Logging ===
 with mlflow.start_run(run_name=f"run_{os.getpid()}") as run:
