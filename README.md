@@ -1,6 +1,17 @@
 # tacotron2_zero-shot
 
 ```bash
+source install.sh
+```
+
+## Entrenamiento
+```bash
+python train.py
+```
+
+## Inferencia (servidor FastAPI)
+
+```bash
 uvicorn infer_api:app --reload
 ```
 
