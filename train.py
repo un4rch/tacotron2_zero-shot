@@ -9,6 +9,13 @@ from torch.utils.data import DataLoader, random_split
 from torch import nn, optim
 from speechbrain.inference.speaker import EncoderClassifier
 from visualizations import plot_loss_curves, plot_mel_spectrograms, plot_gate_outputs
+import mlflow
+import mlflow.pytorch
+
+# === MLflow Setup ===
+MLFLOW_TRACKING_URI = "http://admin:mlflow_password@mlflow.172.16.57.20.nip.io/"
+mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+mlflow.set_experiment("Tacotron2_Zero-Shot")
 
 # === Path Setup ===
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "DeepLearningExamples", "PyTorch", "SpeechSynthesis", "Tacotron2", "tacotron2"))
@@ -39,6 +46,16 @@ with open(HPARAMS_PATH, "r") as f:
     hparams = json.load(f)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# === MLflow Logging ===
+with mlflow.start_run(run_name=f"run_{os.getpid()}") as run:
+    # Guarda hiperparámetros
+    mlflow.log_params(hparams)
+    # (Opcional) Log de otros parámetros relevantes:
+    mlflow.log_param("device", device)
+    mlflow.log_param("optimizer", "Adam")
+    mlflow.log_param("weight_decay", 1e-5)
+    mlflow.log_param("guided_attn_loss_weight", 0.2)
 
 # === Load Speaker Encoder ===
 classifier = EncoderClassifier.from_hparams(
@@ -336,6 +353,7 @@ val_loss_history = []
 
 import matplotlib.pyplot as plt
 
+print(f"Starting training... {hparams["epochs"]} epochs.")
 for epoch in range(hparams["epochs"]):
     model.train()
     epoch_train_losses = []
@@ -424,12 +442,14 @@ for epoch in range(hparams["epochs"]):
                 # Plot gate for first validation sample
                 first_gate = torch.sigmoid(outputs[2][0]).detach().cpu().numpy()  # [T]
                 first_gate_target = gate_targets[0].detach().cpu().numpy()  # [T]
+                gate_path = os.path.join(VIS_DIR, f"gate_epoch{epoch}.png")
                 plot_gate_outputs(
                     first_gate,
                     first_gate_target,
                     threshold=hparams["gate_threshold"],
-                    out_path=os.path.join(VIS_DIR, f"gate_epoch{epoch}.png")
+                    out_path=gate_path
                 )
+                mlflow.log_artifact(gate_path, artifact_path="plots")
                 # Print position of stop-frame (target==1) and gate value there
                 stop_idx = (gate_targets[0] == 1).nonzero(as_tuple=True)[0]
                 if len(stop_idx) > 0:
@@ -441,29 +461,39 @@ for epoch in range(hparams["epochs"]):
     avg_val_loss = np.mean(epoch_val_losses)
     val_loss_history.append(avg_val_loss)
 
+    loss_curve_path = os.path.join(VIS_DIR, f"loss_curves_epoch{epoch}.png")
     plot_loss_curves(
         train_loss_history,
         val_loss_history,
-        os.path.join(VIS_DIR, f"loss_curves_epoch{epoch}.png")
+        loss_curve_path
     )
+    mlflow.log_artifact(loss_curve_path, artifact_path="plots")
 
     if epoch % hparams["checkpoint_interval"] == 0:
         torch.save(model.state_dict(), os.path.join(CHECKPOINTS_DIR, f"tacotron2_epoch{epoch}.pth"))
         print(f"Saved checkpoint at epoch {epoch}")
 
         if val_sample is not None:
+            mel_compare_path = os.path.join(VIS_DIR, f"mel_compare_epoch{epoch}.png")
             plot_mel_spectrograms(
                 val_sample['mel_true'],
                 val_sample['mel_pred'],
-                os.path.join(VIS_DIR, f"mel_compare_epoch{epoch}.png")
+                mel_compare_path
             )
-    
+            mlflow.log_artifact(mel_compare_path, artifact_path="plots")
+
+    mlflow.log_metric("train_loss", avg_train_loss, step=epoch)
+    mlflow.log_metric("val_loss", avg_val_loss, step=epoch)
+
+    print(f"Epoch {epoch} | Train Loss: {avg_train_loss:.3f} | Val Loss: {avg_val_loss:.3f}")
+
     # === EARLY STOPPING ===
     early_stopper(avg_val_loss, model)
     if early_stopper.early_stop:
         print("Early stopping triggered.")
+        best_model_path = os.path.join(CHECKPOINTS_DIR, "best_model.pth")
+        mlflow.log_artifact(best_model_path, artifact_path="models")
         break
 
-    print(f"Epoch {epoch} | Train Loss: {avg_train_loss:.3f} | Val Loss: {avg_val_loss:.3f}")
-
 print("Training complete. Checkpoints saved in checkpoints/")
+mlflow.pytorch.log_model(model, artifact_path="final_model")
