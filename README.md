@@ -6,7 +6,8 @@ source install.sh
 
 ## Entrenamiento
 ```bash
-python train.py
+#python train.py
+python -m torch.distributed.run --nproc_per_node=2 train.py
 ```
 
 ## Inferencia (servidor FastAPI)
