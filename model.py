@@ -379,8 +379,13 @@ class Decoder(nn.Module):
         """
         # (T_out, B) -> (B, T_out)
         alignments = alignments.transpose(0, 1).contiguous()
-        # (T_out, B) -> (B, T_out)
-        gate_outputs = gate_outputs.transpose(0, 1).contiguous()
+        # (T_out, B) -> (B, T_out), pero si viene 1D hay que unsqueeze antes
+        if gate_outputs.dim() == 1:
+            # pasa de [T_out] a [1, T_out]
+            gate_outputs = gate_outputs.unsqueeze(0)
+        else:
+            # caso normal: (T_out, B) -> (B, T_out)
+            gate_outputs = gate_outputs.transpose(0, 1).contiguous()
         # (T_out, B, n_mel_channels) -> (B, T_out, n_mel_channels)
         mel_outputs = mel_outputs.transpose(0, 1).contiguous()
         # decouple frames per step
