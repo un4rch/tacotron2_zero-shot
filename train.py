@@ -2,20 +2,26 @@ import os
 import sys
 import json
 import torch
+import torch.multiprocessing as mp
+mp.set_start_method("spawn", force=True)
+import torch
+import torch.distributed as dist           # ← y ya puedes usar dist.init_process_group(...)
+from torch.nn.parallel import DistributedDataParallel as DDP
 import torchaudio
 import torch.nn.functional as F
 import numpy as np
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, random_split, Subset, DistributedSampler
 from torch import nn, optim
 from speechbrain.inference.speaker import EncoderClassifier
 from visualizations import plot_loss_curves, plot_mel_spectrograms, plot_gate_outputs
 import mlflow
 import mlflow.pytorch
-
-# === MLflow Setup ===
-MLFLOW_TRACKING_URI = "http://admin:mlflow_password@mlflow.172.16.57.20.nip.io/"
-mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-mlflow.set_experiment("Tacotron2_Zero-Shot")
+import pandas as pd
+import librosa
+from pesq import pesq
+from pystoi import stoi
+import pyworld as pw
+from scipy.spatial.distance import euclidean
 
 # === Path Setup ===
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "DeepLearningExamples", "PyTorch", "SpeechSynthesis", "Tacotron2", "tacotron2"))
@@ -45,23 +51,33 @@ os.makedirs(VIS_DIR, exist_ok=True)
 with open(HPARAMS_PATH, "r") as f:
     hparams = json.load(f)
 
-device = "cuda:0" if torch.cuda.is_available() else "cpu"
+# === DistributedDataParallel setup ===
+dist.init_process_group(backend="nccl")
+local_rank = int(os.environ.get("LOCAL_RANK", 0))
+torch.cuda.set_device(local_rank)
+device = torch.device(f"cuda:{local_rank}")
 
-# === MLflow Logging ===
-with mlflow.start_run(run_name=f"run_{os.getpid()}") as run:
-    # Guarda hiperparámetros
+# === MLflow Setup (solo rank 0) ===
+if dist.get_rank() == 0:
+    MLFLOW_TRACKING_URI = "http://admin:mlflow_password@mlflow.172.16.57.20.nip.io/"
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+    mlflow.set_experiment("Tacotron2_Zero-Shot")
+    mlflow_run = mlflow.start_run(run_name=f"run_{os.getpid()}")
+    # Guarda hiperparámetros SOLO EN RANK 0
     mlflow.log_params(hparams)
-    # (Opcional) Log de otros parámetros relevantes:
-    mlflow.log_param("device", device)
+    mlflow.log_param("device", str(device))
     mlflow.log_param("optimizer", "Adam")
     mlflow.log_param("weight_decay", 1e-5)
     mlflow.log_param("guided_attn_loss_weight", 0.2)
 
-# === Load Speaker Encoder ===
+# === Load Speaker Encoder (ahora que DDP está iniciado) ===
 classifier = EncoderClassifier.from_hparams(
     source="speechbrain/spkrec-ecapa-voxceleb",
+    savedir="pretrained_models/spkrec-ecapa-voxceleb",  # explícita para que use un directorio fijo
     run_opts={"device": device}
 )
+# Sincronizamos para que rank>0 espere a que rank0 termine la descarga
+dist.barrier()
 
 # === Dataset Utilities ===
 class TTSDataset(torch.utils.data.Dataset):
@@ -290,7 +306,7 @@ class EarlyStopping:
 
     def __call__(self, val_loss, model=None):
         if self.best_loss is None or val_loss < self.best_loss - self.min_delta:
-            if self.verbose:
+            if self.verbose and dist.get_rank() == 0:
                 print(f"Validation loss improved: {self.best_loss} -> {val_loss}")
             self.best_loss = val_loss
             self.counter = 0
@@ -298,19 +314,81 @@ class EarlyStopping:
                 torch.save(model.state_dict(), self.save_path)
         else:
             self.counter += 1
-            if self.verbose:
+            if self.verbose and dist.get_rank() == 0:
                 print(f"EarlyStopping counter: {self.counter} of {self.patience}")
             if self.counter >= self.patience:
                 self.early_stop = True
 
-# === Prepare Dataset and Dataloader ===
-dataset = TTSDataset(METADATA)
+# === Prepare Dataset and Dataloaders (train/val/test) ===
+full_dataset = TTSDataset(METADATA)
+collate = full_dataset.collate_fn
+
+# 1) Subset opcional
+total_samples = len(full_dataset)
+subset_frac   = hparams.get("subset_frac", 1.0)
+seed          = hparams.get("seed", 42)
+if subset_frac < 1.0:
+    subset_len = int(total_samples * subset_frac)
+    gen        = torch.Generator().manual_seed(seed)
+    idx        = torch.randperm(total_samples, generator=gen)[:subset_len]
+    dataset    = Subset(full_dataset, idx)
+    if dist.get_rank() == 0:
+        print(f"⚡ Usando sólo {subset_len}/{total_samples} ejemplos"
+              f" ({subset_frac*100:.1f}% del dataset completo)")
+else:
+    dataset = full_dataset
+    if dist.get_rank() == 0:
+        print(f"✅ Usando el 100% del dataset ({total_samples} ejemplos)")
+
+# 2) Split train/val/test
 n = len(dataset)
-train_len = int(0.9 * n)
-val_len = n - train_len
-train_set, val_set = random_split(dataset, [train_len, val_len])
-train_loader = DataLoader(train_set, batch_size=hparams["batch_size"], shuffle=True, collate_fn=dataset.collate_fn)
-val_loader = DataLoader(val_set, batch_size=hparams["batch_size"], shuffle=False, collate_fn=dataset.collate_fn)
+n_train = int(0.8 * n)
+n_val   = int(0.1 * n)
+n_test  = n - n_train - n_val
+train_set, val_set, test_set = random_split(
+    dataset,
+    [n_train, n_val, n_test],
+    generator=torch.Generator().manual_seed(seed)
+)
+if dist.get_rank() == 0:
+    print(f"→ Train: {n_train}  |  Val: {n_val}  |  Test: {n_test}")
+
+# 3) Dataloaders con DistributedSampler
+use_workers = 0 if subset_frac < 1.0 else hparams.get("num_workers", 4)
+if dist.get_rank() == 0:
+    print(f"→ DataLoader workers: {use_workers}")
+
+train_sampler = DistributedSampler(train_set,
+                                   num_replicas=dist.get_world_size(),
+                                   rank=dist.get_rank(),
+                                   shuffle=True, seed=seed)
+val_sampler   = DistributedSampler(val_set,
+                                   num_replicas=dist.get_world_size(),
+                                   rank=dist.get_rank(),
+                                   shuffle=False, seed=seed)
+test_sampler  = DistributedSampler(test_set,
+                                   num_replicas=dist.get_world_size(),
+                                   rank=dist.get_rank(),
+                                   shuffle=False, seed=seed)
+
+train_loader = DataLoader(train_set,
+                          batch_size=hparams["batch_size"],
+                          sampler=train_sampler,
+                          collate_fn=collate,
+                          num_workers=use_workers,
+                          pin_memory=True)
+val_loader   = DataLoader(val_set,
+                          batch_size=hparams["batch_size"],
+                          sampler=val_sampler,
+                          collate_fn=collate,
+                          num_workers=use_workers,
+                          pin_memory=True)
+test_loader  = DataLoader(test_set,
+                          batch_size=1,        # 1 para inferencia
+                          sampler=test_sampler,
+                          collate_fn=collate,
+                          num_workers=use_workers,
+                          pin_memory=True)
 
 # === Build Model ===
 model = Tacotron2(
@@ -338,6 +416,7 @@ model = Tacotron2(
     decoder_no_early_stopping=hparams["decoder_no_early_stopping"],
     speaker_embedding_dim=hparams["speaker_embedding_dim"]
 ).to(device)
+model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 optimizer = optim.Adam(model.parameters(), lr=hparams["learning_rate"], weight_decay=1e-5)
 criterion = Tacotron2CombinedLoss(guided_attn_loss_weight=0.2, sigma=0.4, alpha=1.0)
 # Early stopping
@@ -348,152 +427,321 @@ early_stopper = EarlyStopping(
     save_path=os.path.join(CHECKPOINTS_DIR, "best_model.pth")
 )
 
+# Antes del bucle de entrenamiento, instanciamos las pérdidas “oficiales”
+taco_loss_fn    = Tacotron2Loss().to(device)
+guided_loss_fn  = GuidedAttentionLoss(
+    sigma=hparams.get("guided_attn_sigma", 0.4),
+    alpha=hparams.get("guided_attn_alpha", 1.0)
+).to(device)
+attn_weight     = hparams.get("guided_attn_loss_weight", 0.2)
+
 train_loss_history = []
+train_eval_history = []
 val_loss_history = []
 
 import matplotlib.pyplot as plt
 
-print(f"Starting training... {hparams["epochs"]} epochs.")
-for epoch in range(hparams["epochs"]):
+if dist.get_rank() == 0:
+    print(f"Starting training... {hparams['epochs']} epochs.")
+
+for epoch in range(hparams['epochs']):
+    train_sampler.set_epoch(epoch)
     model.train()
     epoch_train_losses = []
-    gate_stats_train = []
+    gate_stats_train   = []
 
+    # --- Training ---
     for wav_paths, text_padded, input_lengths, speaker_ids in train_loader:
-        # === Extract MELs and gates for the batch
+        # === 1) Prepara MELs y targets ===
         mels = [get_mel(wp) for wp in wav_paths]
-        gates = [get_gate_target(m) for m in mels]
         mel_lengths = [m.shape[1] for m in mels]
-        max_len = max(mel_lengths)
-        mel_targets = torch.stack([F.pad(m, (0, max_len - m.shape[1])) for m in mels]).to(device)  # [B, n_mel, T]
-        gate_targets = torch.stack([F.pad(g, (0, max_len - g.shape[0])) for g in gates]).to(device)  # [B, T]
-        output_lengths = torch.LongTensor(mel_lengths).to(device)
-        # === Speaker Embeddings for batch (zero-shot ready)
-        spk_embeddings = torch.stack([get_speaker_embedding(wp, classifier) for wp in wav_paths])
-        #print("spk_embeddings shape:", spk_embeddings.shape)  # Debe ser [B, 192]
-        inputs = (text_padded.to(device), input_lengths.to(device), mel_targets, max_len, output_lengths)
-        model.zero_grad()
-        outputs = model(inputs, speaker_embedding=spk_embeddings)
-        loss = criterion(
-            outputs, (mel_targets, gate_targets), 
-            input_lengths=input_lengths, 
-            output_lengths=output_lengths
+        max_len     = max(mel_lengths)
+
+        # a) mel_targets padded -> [B, n_mel, T]
+        mel_targets = torch.stack([
+            F.pad(m, (0, max_len - m.shape[1]))
+            for m in mels
+        ], dim=0).to(device)
+
+        # b) gate_targets -> [B, T]
+        arange      = torch.arange(max_len, device=device).unsqueeze(0)      # (1, T)
+        lengths     = torch.LongTensor(mel_lengths).unsqueeze(1).to(device)  # (B,1)
+        output_lengths = lengths.squeeze(1)                                  # (B,)
+        gate_targets   = (arange >= lengths).float()                         # (B, T)
+
+        # c) speaker embeddings -> [B, D]
+        spk_embeddings = torch.stack([
+            get_speaker_embedding(wp, classifier)
+            for wp in wav_paths
+        ], dim=0).to(device)
+
+        # === 2) Forward pass ===
+        inputs = (
+            text_padded.to(device),
+            input_lengths.to(device),
+            mel_targets,
+            max_len,
+            output_lengths
         )
+        model.zero_grad()
+        outs = model(inputs, speaker_embedding=spk_embeddings)
+
+        # unpack seguro (parche al vendor code)
+        if len(outs) == 3:
+            mel_out, gate_out, alignments = outs
+            mel_out_postnet = model.module.postnet(mel_out) if isinstance(model, DDP) else model.postnet(mel_out)
+        else:
+            mel_out, mel_out_postnet, gate_out, alignments = outs
+
+        # === 3) Pérdida Tacotron2 (mel + gate) ===
+        mg_loss = taco_loss_fn(
+            model_output=(mel_out, mel_out_postnet, gate_out, alignments),
+            targets=(mel_targets, gate_targets)
+        )
+
+        # === 4) Guided Attention Loss ===
+        ga_loss = guided_loss_fn(
+            alignments,
+            input_lengths.to(device),
+            output_lengths
+        )
+
+        # === 5) Total y backward ===
+        loss = mg_loss + attn_weight * ga_loss
         loss.backward()
         optimizer.step()
-
         epoch_train_losses.append(loss.item())
 
-        # === DEBUG gate values for train ===
+        # === 6) Estadísticas de gate para debug ===
         with torch.no_grad():
-            gate_out = outputs[2]   # [B, T] o [B*T, 1]
-            gate_sigmoid = torch.sigmoid(gate_out).detach().cpu()
+            gs = torch.sigmoid(gate_out).cpu()
             gate_stats_train.append([
-                gate_sigmoid.mean().item(),
-                gate_sigmoid.min().item(),
-                gate_sigmoid.max().item()
+                gs.mean().item(),
+                gs.min().item(),
+                gs.max().item()
             ])
 
-    # Print train gate stats summary
+    # --- Print resumen train ---  
     gate_stats_train = np.array(gate_stats_train)
-    print(f"[Train][Epoch {epoch}] Gate sigmoid mean: {gate_stats_train[:,0].mean():.4f} | min: {gate_stats_train[:,1].min():.4f} | max: {gate_stats_train[:,2].max():.4f}")
+    if dist.get_rank() == 0:
+        print(f"[Train][Epoch {epoch}] Gate sigmoid mean: {gate_stats_train[:,0].mean():.4f} "
+              f"| min: {gate_stats_train[:,1].min():.4f} "
+              f"| max: {gate_stats_train[:,2].max():.4f}")
 
     avg_train_loss = np.mean(epoch_train_losses)
     train_loss_history.append(avg_train_loss)
 
-    # === Validation loop
+    # === Train-eval loop (mismo train_loader pero en .eval()) ===
     model.eval()
-    epoch_val_losses = []
-    gate_stats_val = []
-    val_sample = None
+    train_eval_losses = []
     with torch.no_grad():
-        for i, (wav_paths, text_padded, input_lengths, speaker_ids) in enumerate(val_loader):
-            mels = [get_mel(wp) for wp in wav_paths]
-            gates = [get_gate_target(m) for m in mels]
+        for wav_paths, text_padded, input_lengths, speaker_ids in train_loader:
+            mels        = [get_mel(w) for w in wav_paths]
             mel_lengths = [m.shape[1] for m in mels]
-            max_len = max(mel_lengths)
-            mel_targets = torch.stack([F.pad(m, (0, max_len - m.shape[1])) for m in mels])
-            gate_targets = torch.stack([F.pad(g, (0, max_len - g.shape[0])) for g in gates])
-            output_lengths = torch.LongTensor(mel_lengths).to(device)
-            spk_embeddings = torch.stack([get_speaker_embedding(wp, classifier) for wp in wav_paths])
+            max_len     = max(mel_lengths)
+            mel_tgt     = torch.stack([F.pad(m, (0, max_len-m.shape[1])) for m in mels], dim=0).to(device)
 
-            inputs = (text_padded.to(device), input_lengths.to(device), mel_targets, max_len, output_lengths)
-            outputs = model(inputs, speaker_embedding=spk_embeddings)
-            val_loss = criterion(
-                outputs, (mel_targets, gate_targets), 
-                input_lengths=input_lengths, 
-                output_lengths=output_lengths
+            arange      = torch.arange(max_len, device=device).unsqueeze(0)
+            lengths     = torch.LongTensor(mel_lengths).unsqueeze(1).to(device)
+            out_lens    = lengths.squeeze(1)
+            gate_tgt    = (arange >= lengths).float()
+
+            spk_emb     = torch.stack([get_speaker_embedding(w, classifier) for w in wav_paths], dim=0).to(device)
+            inputs      = (text_padded.to(device), input_lengths.to(device), mel_tgt, max_len, out_lens)
+
+            outs = model(inputs, speaker_embedding=spk_emb)
+            if len(outs) == 3:
+                mel_out, gate_out, alignments = outs
+                mel_out_post = model.module.postnet(mel_out) if isinstance(model, DDP) else model.postnet(mel_out)
+            else:
+                mel_out, mel_out_post, gate_out, alignments = outs
+
+            mg = taco_loss_fn(
+                model_output=(mel_out, mel_out_post, gate_out, alignments),
+                targets=(mel_tgt, gate_tgt)
             )
+            ga = guided_loss_fn(alignments, input_lengths.to(device), out_lens)
+            train_eval_losses.append((mg + attn_weight * ga).item())
+
+    avg_train_eval = float(np.mean(train_eval_losses))
+    train_eval_history.append(avg_train_eval)
+
+    # === Validation loop ===
+    epoch_val_losses = []
+    gate_stats_val   = []
+    val_sample       = None
+
+    with torch.no_grad():
+        for wav_paths, text_padded, input_lengths, speaker_ids in val_loader:
+            mels        = [get_mel(wp) for wp in wav_paths]
+            mel_lengths = [m.shape[1] for m in mels]
+            max_len     = max(mel_lengths)
+
+            mel_targets = torch.stack([
+                F.pad(m, (0, max_len - m.shape[1])) for m in mels
+            ], dim=0).to(device)
+
+            arange        = torch.arange(max_len, device=device).unsqueeze(0)
+            lengths       = torch.LongTensor(mel_lengths).unsqueeze(1).to(device)
+            output_lengths = lengths.squeeze(1)
+            gate_targets   = (arange >= lengths).float()
+
+            spk_embeddings = torch.stack([
+                get_speaker_embedding(wp, classifier) for wp in wav_paths
+            ], dim=0).to(device)
+
+            inputs = (
+                text_padded.to(device),
+                input_lengths.to(device),
+                mel_targets,
+                max_len,
+                output_lengths
+            )
+            outs = model(inputs, speaker_embedding=spk_embeddings)
+            if len(outs) == 3:
+                mel_out, gate_out, alignments = outs
+                mel_out_postnet = model.module.postnet(mel_out) if isinstance(model, DDP) else model.postnet(mel_out)
+            else:
+                mel_out, mel_out_postnet, gate_out, alignments = outs
+
+            mg_loss = taco_loss_fn(
+                model_output=(mel_out, mel_out_postnet, gate_out, alignments),
+                targets=(mel_targets, gate_targets)
+            )
+            ga_loss = guided_loss_fn(alignments, input_lengths.to(device), output_lengths)
+            val_loss = mg_loss + attn_weight * ga_loss
             epoch_val_losses.append(val_loss.item())
 
-            # === DEBUG gate values for validation ===
-            gate_out = outputs[2]   # [B, T]
-            gate_sigmoid = torch.sigmoid(gate_out).detach().cpu()
-            gate_stats_val.append([
-                gate_sigmoid.mean().item(),
-                gate_sigmoid.min().item(),
-                gate_sigmoid.max().item()
-            ])
+            gs = torch.sigmoid(gate_out).cpu()
+            gate_stats_val.append([gs.mean().item(), gs.min().item(), gs.max().item()])
+
             if val_sample is None:
                 val_sample = {
-                    'mel_true': mel_targets[0].detach().cpu().numpy(),
-                    'mel_pred': outputs[1][0].detach().cpu().numpy(),
+                    'mel_true': mel_targets[0].cpu().numpy(),
+                    'mel_pred': mel_out_postnet[0].cpu().numpy(),
+                    'gate_out': gs[0].numpy(),
+                    'gate_tgt': gate_targets[0].cpu().numpy()
                 }
-                # Plot gate for first validation sample
-                first_gate = torch.sigmoid(outputs[2][0]).detach().cpu().numpy()  # [T]
-                first_gate_target = gate_targets[0].detach().cpu().numpy()  # [T]
-                gate_path = os.path.join(VIS_DIR, f"gate_epoch{epoch}.png")
-                plot_gate_outputs(
-                    first_gate,
-                    first_gate_target,
-                    threshold=hparams["gate_threshold"],
-                    out_path=gate_path
-                )
-                mlflow.log_artifact(gate_path, artifact_path="plots")
-                # Print position of stop-frame (target==1) and gate value there
-                stop_idx = (gate_targets[0] == 1).nonzero(as_tuple=True)[0]
-                if len(stop_idx) > 0:
-                    print(f"[Valid][Epoch {epoch}] Stop frame idx: {stop_idx[0].item()} | Gate sigmoid at stop: {first_gate[stop_idx[0].item()]:.4f}")
 
+    # --- Print resumen valid ---
     gate_stats_val = np.array(gate_stats_val)
-    print(f"[Valid][Epoch {epoch}] Gate sigmoid mean: {gate_stats_val[:,0].mean():.4f} | min: {gate_stats_val[:,1].min():.4f} | max: {gate_stats_val[:,2].max():.4f}")
+    if dist.get_rank() == 0:
+        print(f"[Valid][Epoch {epoch}] Gate sigmoid mean: {gate_stats_val[:,0].mean():.4f} "
+              f"| min: {gate_stats_val[:,1].min():.4f} "
+              f"| max: {gate_stats_val[:,2].max():.4f}")
 
     avg_val_loss = np.mean(epoch_val_losses)
     val_loss_history.append(avg_val_loss)
 
-    loss_curve_path = os.path.join(VIS_DIR, f"loss_curves_epoch{epoch}.png")
-    plot_loss_curves(
-        train_loss_history,
-        val_loss_history,
-        loss_curve_path
-    )
-    mlflow.log_artifact(loss_curve_path, artifact_path="plots")
+    # --- Ploteos y checkpoints ---
+    if dist.get_rank() == 0:
+        loss_curve_path = os.path.join(VIS_DIR, f"loss_curves_epoch{epoch}.png")
+        plot_loss_curves(train_eval_history, val_loss_history, loss_curve_path)
+        mlflow.log_artifact(loss_curve_path, artifact_path="plots")
 
-    if epoch % hparams["checkpoint_interval"] == 0:
-        torch.save(model.state_dict(), os.path.join(CHECKPOINTS_DIR, f"tacotron2_epoch{epoch}.pth"))
-        print(f"Saved checkpoint at epoch {epoch}")
+        if epoch % hparams["checkpoint_interval"] == 0:
+            torch.save(model.state_dict(),
+                       os.path.join(CHECKPOINTS_DIR, f"tacotron2_epoch{epoch}.pth"))
+            print(f"Saved checkpoint at epoch {epoch}")
 
-        if val_sample is not None:
-            mel_compare_path = os.path.join(VIS_DIR, f"mel_compare_epoch{epoch}.png")
-            plot_mel_spectrograms(
-                val_sample['mel_true'],
-                val_sample['mel_pred'],
-                mel_compare_path
-            )
-            mlflow.log_artifact(mel_compare_path, artifact_path="plots")
+            if val_sample is not None:
+                mel_compare_path = os.path.join(VIS_DIR, f"mel_compare_epoch{epoch}.png")
+                plot_mel_spectrograms(val_sample['mel_true'], val_sample['mel_pred'], mel_compare_path)
+                mlflow.log_artifact(mel_compare_path, artifact_path="plots")
+                gate_plot_path = os.path.join(VIS_DIR, f"gate_epoch{epoch}.png")
+                plot_gate_outputs(val_sample['gate_out'], val_sample['gate_tgt'],
+                                  threshold=hparams["gate_threshold"], out_path=gate_plot_path)
+                mlflow.log_artifact(gate_plot_path, artifact_path="plots")
 
     mlflow.log_metric("train_loss", avg_train_loss, step=epoch)
     mlflow.log_metric("val_loss", avg_val_loss, step=epoch)
 
-    print(f"Epoch {epoch} | Train Loss: {avg_train_loss:.3f} | Val Loss: {avg_val_loss:.3f}")
+    if dist.get_rank() == 0:
+        print(f"[Epoch {epoch}] "
+              f"Train(train-mode mean): {train_loss_history[-1]:.1f}  |  "
+              f"Train(eval-mode mean): {avg_train_eval:.1f}  |  "
+              f"Val(eval-mode): {avg_val_loss:.1f}")
 
     # === EARLY STOPPING ===
     early_stopper(avg_val_loss, model)
     if early_stopper.early_stop:
-        print("Early stopping triggered.")
+        if dist.get_rank() == 0:
+            print("Early stopping triggered.")
         best_model_path = os.path.join(CHECKPOINTS_DIR, "best_model.pth")
         mlflow.log_artifact(best_model_path, artifact_path="models")
         break
 
-print("Training complete. Checkpoints saved in checkpoints/")
-mlflow.pytorch.log_model(model, artifact_path="final_model")
+
+if dist.get_rank() == 0:
+    print("Training complete. Checkpoints saved in checkpoints/")
+    mlflow.pytorch.log_model(model, artifact_path="final_model")
+
+if dist.get_rank() == 0: # sintetiza todo el test set y calcula MCD, PESQ, STOI, F0‐RMSE y V/UV error
+
+    # 1) Carga modelo y WaveGlow
+    tacotron2 = Tacotron2(**hparams).to(device)
+    tacotron2.load_state_dict(torch.load(
+        os.path.join(CHECKPOINTS_DIR, "best_model.pth")
+    ))
+    tacotron2.eval()
+
+    waveglow = torch.hub.load(
+        "nvidia/DeepLearningExamples:torchhub",
+        "nvidia_waveglow256pyt_fp16"
+    )
+    waveglow = waveglow.remove_weightnorm(waveglow).to(device).eval()
+
+    report = []
+    for wav_paths, text_padded, input_lengths, speaker_ids in test_loader:
+        wp = wav_paths[0]
+        # 2.1) GT audio
+        gt_wav, sr = torchaudio.load(wp)
+        gt = gt_wav.squeeze(0).numpy()
+        # 2.2) Inferencia TTS
+        with torch.no_grad():
+            seq    = text_padded.to(device)
+            ilen   = input_lengths.to(device)
+            spk_emb= get_speaker_embedding(wp, classifier).unsqueeze(0)
+            mel    = tacotron2.inference((seq, ilen),
+                                         speaker_embedding=spk_emb)
+            syn    = waveglow.infer(mel).squeeze().cpu().numpy()
+
+        # 3) Métricas objetivas
+        # 3.1 MCD
+        gt_mfcc  = librosa.feature.mfcc(gt, sr=sr, n_mfcc=13)
+        syn_mfcc = librosa.feature.mfcc(syn, sr=sr, n_mfcc=13)
+        _, wp_d  = librosa.sequence.dtw(gt_mfcc.T, syn_mfcc.T,
+                                        metric='euclidean')
+        mcd = np.mean([
+            euclidean(gt_mfcc[:,i], syn_mfcc[:,j]) for (i,j) in wp_d
+        ]) * (10/np.log(10)*np.sqrt(2))
+
+        # 3.2 PESQ (wideband)
+        pesq_score = pesq(sr, gt, syn, 'wb')
+
+        # 3.3 STOI
+        stoi_score = stoi(gt, syn, sr, extended=False)
+
+        # 3.4 F0‐RMSE & V/UV
+        f0_gt, t_gt   = pw.dio(gt, sr);   f0_gt = pw.stonemask(gt, f0_gt, t_gt, sr)
+        f0_syn, _    = pw.dio(syn, sr);  f0_syn= pw.stonemask(syn, f0_syn, t_gt, sr)
+        f0_rmse      = float(np.sqrt(np.mean((f0_gt - f0_syn)**2)))
+        vuv_err      = float(np.mean((f0_gt>0) != (f0_syn>0)))
+
+        report.append({
+            "wav": os.path.basename(wp),
+            "MCD": float(mcd),
+            "PESQ": float(pesq_score),
+            "STOI": float(stoi_score),
+            "F0_RMSE": f0_rmse,
+            "VUV_error": vuv_err
+        })
+
+    # 4) Guarda CSV
+    df      = pd.DataFrame(report)
+    out_csv = os.path.join(CHECKPOINTS_DIR, "evaluation_report.csv")
+    df.to_csv(out_csv, index=False)
+    print(f"Saved evaluation report → {out_csv}")
+
+
+dist.destroy_process_group()
