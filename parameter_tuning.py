@@ -243,7 +243,7 @@ METADATA = metadata_path
 def objective(trial):
     # Sample training hyperparams
     lr    = trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True)
-    bs    = trial.suggest_categorical("batch_size", [16, 32, 64])
+    bs    = trial.suggest_categorical("batch_size", [4, 8, 16])
     gaw   = trial.suggest_float("guided_attn_loss_weight", 0.1, 1.0)
     sigma = trial.suggest_float("guided_attn_sigma", 0.1, 1.0)
     alpha = trial.suggest_float("guided_attn_alpha", 0.5, 2.0)
