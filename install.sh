@@ -37,7 +37,7 @@ source venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 
-#python make_metadata.py
+python make_metadata.py
 
 #python train.py
 
