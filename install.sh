@@ -37,8 +37,8 @@ source venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 
-python make_metadata.py
+#python make_metadata.py
 
-python train.py
+#python train.py
 
-python infer.py --checkpoint checkpoints/tacotron2_epoch9.pth --text "Hello, I am Unai" --speaker_wav data/my_voice/wavs/Voz1.wav data/my_voice/wavs/Voz2.wav data/my_voice/wavs/Voz3.wav --out_wav ex.wav
+#python infer.py --checkpoint checkpoints/tacotron2_epoch9.pth --text "Hello, I am Unai" --speaker_wav data/my_voice/wavs/Voz1.wav data/my_voice/wavs/Voz2.wav data/my_voice/wavs/Voz3.wav --out_wav ex.wav
