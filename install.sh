@@ -9,9 +9,6 @@ echo "Copying model.py to $TACO_DIR ..."
 mkdir -p "$TACO_DIR"
 cp -f model.py "$TACO_DIR"/
 
-FILE="train-clean-100.tar.gz"
-DIR="data/LibriTTS/"
-
 # Check if the file exists
 if [ ! -f "$FILE" ]; then
     echo "$FILE not found. Downloading..."
@@ -28,7 +25,12 @@ else
     echo "Data already extracted in $DIR. Skipping extraction."
 fi
 
-#rm "$FILE"  # Clean up the tar file after extraction
+#rm "$FILE"
+
+wget https://downloads.apache.org/spark/spark-3.5.1/spark-3.5.1-bin-hadoop3.tgz
+tar xzf spark-3.5.1-bin-hadoop3.tgz -C $HOME
+export SPARK_HOME="$HOME/spark-3.5.1-bin-hadoop3"
+export PATH="$SPARK_HOME/bin:$PATH"
 
 python -m venv venv
 source venv/bin/activate
