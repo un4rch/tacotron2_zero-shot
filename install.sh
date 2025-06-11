@@ -9,6 +9,9 @@ echo "Copying model.py to $TACO_DIR ..."
 mkdir -p "$TACO_DIR"
 cp -f model.py "$TACO_DIR"/
 
+FILE="train-clean-100.tar.gz"
+DIR="data/LibriTTS/"
+
 # Check if the file exists
 if [ ! -f "$FILE" ]; then
     echo "$FILE not found. Downloading..."
