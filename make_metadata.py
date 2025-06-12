@@ -2,6 +2,8 @@ import os
 import glob
 import csv
 
+# data/LibriTTS/LibriTTS/train-clean-100/<speaker_id>/<chapter_id>/<file>.normalized.txt
+
 # Cambia esta ruta según tu estructura si lo necesitas
 root_dir = "data/LibriTTS/LibriTTS/train-clean-100"
 metadata_path = "data/LibriTTS/metadata.csv"
