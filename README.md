@@ -4,6 +4,28 @@
 source install.sh
 ```
 
+## Spark y cassandra
+
+```sql
+CREATE KEYSPACE IF NOT EXISTS testks
+WITH replication = {
+  'class': 'SimpleStrategy',
+  'replication_factor': 1
+};
+USE testks;
+CREATE TABLE IF NOT EXISTS metadata (
+  wav_path TEXT PRIMARY KEY,
+  transcript TEXT,
+  speaker_id TEXT
+);
+```
+
+```bash
+$SPARK_HOME/bin/spark-submit \
+  --packages com.datastax.spark:spark-cassandra-connector_2.12:3.5.0 \
+  spark_cassandra.py
+```
+
 ## Entrenamiento
 ```bash
 #python train.py
