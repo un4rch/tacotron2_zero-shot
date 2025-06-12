@@ -30,7 +30,7 @@ fi
 
 #rm "$FILE"
 
-wget https://downloads.apache.org/spark/spark-3.5.1/spark-3.5.1-bin-hadoop3.tgz
+wget https://archive.apache.org/dist/spark/spark-3.5.1/spark-3.5.1-bin-hadoop3.tgz
 tar xzf spark-3.5.1-bin-hadoop3.tgz -C $HOME
 export SPARK_HOME="$HOME/spark-3.5.1-bin-hadoop3"
 export PATH="$SPARK_HOME/bin:$PATH"
